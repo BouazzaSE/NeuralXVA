@@ -1,5 +1,5 @@
 # NeuralXVA
-NeuralXVA is a simulation code written for the paper **Hierarchical Simulation for Learning With Defaults** by Abbas-Turki Lokman, Crépey Stéphane and Saadeddine Bouazza (see citation below), implementing:
+NeuralXVA is a simulation code written for the paper **"Hierarchical Simulation for Learning With Defaults"** by Abbas-Turki Lokman, Crépey Stéphane and Saadeddine Bouazza (see citation below), implementing:
 * the generation via Monte Carlo of risk factor paths, default indicators and mark-to-market trajectories in a multi-dimensional setup with multiple economies and counterparties;
 * the learning of a CVA based on the generated Monte Carlo samples of the payoffs (codebase to be extended soon for other XVAs).
 
