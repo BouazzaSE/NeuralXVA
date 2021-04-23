@@ -1,9 +1,9 @@
 # NeuralXVA
-NeuralXVA is a simulation code implementing:
+NeuralXVA is a simulation code written for the paper **Hierarchical Simulation for Learning With Defaults** by Abbas-Turki Lokman, Crépey Stéphane and Saadeddine Bouazza (see citation below), implementing:
 * the generation via Monte Carlo of risk factor paths, default indicators and mark-to-market trajectories in a multi-dimensional setup with multiple economies and counterparties;
 * the learning of a CVA based on the generated Monte Carlo samples of the payoffs (codebase to be extended soon for other XVAs).
 
-We invite first users to first look at the `Demo - Learning a CVA using hierarchical simulation.ipynb` notebook.
+We recommend first users to first look at the `Demo - Simulations on the GPU.ipynb` notebook to get a handle of how the simulation data is stored and then `Demo - Learning a CVA using hierarchical simulation.ipynb` notebook for a demo of the learning procedure.
 
 The diffusion engine is implemented using custom CUDA routines for maximum speed on NVidia GPUs. CUDA kernels are compiled just-in-time using Numba, which allows to test for various problem sizes without having to recompile any source code at the cost of a very small overhead when instanciating a `DiffusionEngine`.
 
@@ -62,4 +62,4 @@ cva_estimator_portfolio_int = CVAEstimatorPortfolioInt(prev_reset_arr, True, Fal
 
 # notice we do 4 epochs instead of 8 this time in order to keep the same number of total SGD steps
 ```
-works on Google Colaboratory.
+works on Google Colaboratory. *(ignore the remark on the batch size if using the `Demo - Simulations on the GPU.ipynb` notebook)*
