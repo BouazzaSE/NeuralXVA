@@ -18,7 +18,7 @@ CUDA kernels are compiled just-in-time using Numba, which allows to test for var
 
 As opposed to most machine learning use-cases where the final product is the trained model and only inference is being performed when used by the end-user, in our case the training process itself is part of the final product because the distribution of the training data changes between two uses as the market data from which the diffusion parameters are inferred change. This calls for more care when writing the training procedures as they will be called at each use.
 
-Thus, we chose to implement the learning schemes using PyTorch. This allows for interoperability with custom CUDA kernels or other CUDA-based packages implementing the CUDA Array Interface (*ie* arrays have the `__cuda_array_interface__` attribute). In particular, this allows us to reuse buffers from `DiffusionEngine` (which avoids unnecessary memory allocations) or to use fast cuSOLVER-based linear algebra routines from the `cupy` package on PyTorch tensors.
+Thus, we chose to implement the learning schemes using PyTorch. This allows for interoperability with custom CUDA kernels or other CUDA-based packages implementing the CUDA Array Interface (*ie* arrays have the `__cuda_array_interface__` attribute). In particular, this allows us to reuse buffers from `DiffusionEngine` (which avoids unnecessary memory allocations) or to use fast cuSOLVER-based linear algebra routines from the `cupy` package on PyTorch tensors. PyTorch also exposes many of the CUDA internals, including whether to use pinned host memory or not. We use it by default to accelerate the data transfers between the CPU and the GPU.
 
 ## Citing
 If you use this code in your work, we strongly encourage you to both cite this Github repository (with the corresponding identifier for the commit you are looking at) and the papers describing our learning schemes:
@@ -65,3 +65,5 @@ cva_estimator_portfolio_int = CVAEstimatorPortfolioInt(prev_reset_arr, True, Fal
 # notice we do 4 epochs instead of 8 this time in order to keep the same number of total SGD steps
 ```
 works on Google Colaboratory. *(ignore the remark on the batch size if using the `Demo - Simulations on the GPU.ipynb` notebook)*
+
+Also make sure the GPU is enabled by navigating to *"Edit"* -> *"Notebook Settings"* and choosing *"GPU"* in *"Hardware Accelerator"*.
