@@ -7,7 +7,7 @@ We recommend first users to first look at the `Demo - Simulations on the GPU.ipy
 
 ## Fast simulations & trainings on the GPU
 
-Since Monte-Carlo (nested or not) simulations are parallel in nature, they easily lend themselves to parallelization on GPUs. The diffusion engine is implemented using custom CUDA routines for maximum speed on NVidia GPUs and implements a few optimizations:
+Since Monte-Carlo (nested or not) simulations are parallel in nature, they easily lend themselves to parallelization on GPUs. The diffusion engine is implemented using custom CUDA routines for maximum speed on NVidia GPUs and implements a few optimizations (some of which are classic and inline with https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html):
 * coalesced memory accesses for fast read/writes in the GPU global memory: this is achieved by having the Monte-Carlo scenario in the container array of any simulated process indexed using the last axis in the array and having a thread configuration such that two successive threads will correspond to two successive Monte-Carlo scenarios;
 * all diffusion parameters stored in the constant memory: provides high-speed access to read-only data, which can be accessed by all threads at the same time using broadcasting;
 * the shared memory is used as a fast buffer for storing the specifications of the products;
