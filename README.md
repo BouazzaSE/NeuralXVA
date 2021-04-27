@@ -1,13 +1,24 @@
 # NeuralXVA
-NeuralXVA is a simulation code written for the paper **"Hierarchical Simulation for Learning With Defaults"** by Abbas-Turki Lokman, Crépey Stéphane and Saadeddine Bouazza (see citation below), implementing:
+NeuralXVA is a simulation code written for the paper **"Hierarchical Simulation for Learning With Defaults"** by Abbas-Turki Lokman, Crépey Stéphane and Saadeddine Bouazza (see citation below). It implements:
 * the generation via Monte Carlo of paths of diffusion risk factors, default indicators and mark-to-markets in a multi-dimensional setup with multiple economies and counterparties;
-* the learning of a CVA based on the generated Monte Carlo samples of the payoffs (codebase to be extended soon for other XVAs).
+* the learning of a CVA using a Neural Network regression based on the generated Monte Carlo samples of the payoffs (codebase to be extended soon for other XVAs).
 
 We recommend first users to first look at the `Demo - Simulations on the GPU.ipynb` notebook to get a handle of how the simulation data is stored and then the `Demo - Learning a CVA using hierarchical simulation.ipynb` notebook for a demo of the learning procedure.
 
-The diffusion engine is implemented using custom CUDA routines for maximum speed on NVidia GPUs. CUDA kernels are compiled just-in-time using Numba, which allows to test for various problem sizes without having to recompile any source code at the cost of a very small overhead when instanciating a `DiffusionEngine`.
+## Fast simulations & trainings on the GPU
 
-The learning of the CVA is done via Neural Network regression and uses PyTorch. This allows for interoperability with custom CUDA kernels or other CUDA-based packages implementing the CUDA Array Interface (*ie* arrays have the `__cuda_array_interface__` attribute). In particular, this allows us to reuse buffers from `DiffusionEngine` or to use fast cuSOLVER-based linear algebra routines from the `cupy` package on PyTorch tensors.
+Since Monte-Carlo (nested or not) simulations are parallel in nature, they easily lend themselves to parallelization on GPUs. The diffusion engine is implemented using custom CUDA routines for maximum speed on NVidia GPUs and implements a few optimizations:
+* coalesced memory accesses for fast read/writes in the GPU global memory: this is achieved by having the Monte-Carlo scenario in the container array of any simulated process indexed using the last axis in the array and having a thread configuration such that two successive threads will correspond to two successive Monte-Carlo scenarios;
+* all diffusion parameters stored in the constant memory: provides high-speed access to read-only data, which can be accessed by all threads at the same time using broadcasting;
+* using Python closures to construct special kernels for specific problem sizes: many loops depending on those sizes are then unrollable, which allows then the compiler to put local arrays in registers when possible;
+* default indicators are bit-packed in 8-bit integers: at any time-step, the default indicators vector will be of size `ceil(p/8)` where `p` is the number of counterparties, and the default indicator for the `i`-th counterparty will be stored in the `(i-1 mod 8)+1`-th bit of the `floor((i-1)/8)+1`-th component of that array (this can be read using bitwise operations);
+* batched simulations: we batch the simulations over the time axis, *ie* on the GPU we only simulate the trajectories over a time interval of size `cDtoH_freq` (see the parameters in the notebook) and copy each time the result back to the CPU where the different time batches are *"glued"* together to form the full trajectories from time `0` until maturity.
+
+CUDA kernels are compiled just-in-time using Numba, which allows to test for various problem sizes without having to recompile any source code at the cost of a very small overhead when instanciating a `DiffusionEngine`. This approach is similar to runtime compilation using `nvrtc` (https://docs.nvidia.com/cuda/nvrtc/) in CUDA C/C++.
+
+As opposed to most machine learning use-cases where the final product is the trained model and only inference is being performed when used by the end-user, in our case the training process itself is part of the final product because the distribution of the training data changes between two uses as the market data from which the diffusion parameters are inferred change. This calls for more care when writing the training procedures as they will be called at each use.
+
+Thus, we chose to implement the learning schemes using PyTorch. This allows for interoperability with custom CUDA kernels or other CUDA-based packages implementing the CUDA Array Interface (*ie* arrays have the `__cuda_array_interface__` attribute). In particular, this allows us to reuse buffers from `DiffusionEngine` or to use fast cuSOLVER-based linear algebra routines from the `cupy` package on PyTorch tensors.
 
 ## Citing
 If you use this code in your work, we strongly encourage you to both cite this Github repository (with the corresponding identifier for the commit you are looking at) and the papers describing our learning schemes:
@@ -17,15 +28,6 @@ If you use this code in your work, we strongly encourage you to both cite this G
   author={Abbas-Turki, Lokman A and Cr{\'e}pey, St{\'e}phane and Saadeddine, Bouazza},
   year={\ndd},
   note={unpublished}
-}
-
-@article{CrepeyHoskinsonSaadeddine2019,
-  title={XVA analysis from the balance sheet},
-  author={Albanese, Claudio and Cr{\'e}pey, St{\'e}phane and Hoskinson, Rodney and Saadeddine, Bouazza},
-  journal={Quantitative Finance},
-  pages={1--25},
-  year={2020},
-  publisher={Taylor \& Francis}
 }
 ```
 
