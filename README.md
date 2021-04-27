@@ -13,13 +13,13 @@ Since Monte-Carlo (nested or not) simulations are parallel in nature, they easil
 * the shared memory is used as a fast buffer for storing the specifications of the products;
 * using Python closures to construct special kernels for specific problem sizes: many loops depending on those sizes are then unrollable, which allows the compiler to put local arrays in registers when possible;
 * default indicators are bit-packed in 8-bit integers: at any time-step, the default indicators vector will be of size `ceil(p/8)` where `p` is the number of counterparties, and the default indicator for the `i`-th counterparty will be stored in the `(i-1 mod 8)+1`-th bit of the `floor((i-1)/8)+1`-th component of that array (this can be read using bitwise operations);
-* batched simulations: we batch the simulations over the time axis, *ie* on the GPU we only simulate the trajectories over a time interval of size `cDtoH_freq` (see the parameters in the notebook) and copy each time the result back to the CPU where the different time batches are *"glued"* together to form the full trajectories from time `0` until maturity.
+* batched simulations: we batch the simulations over the time axis, *i.e.* on the GPU we only simulate the trajectories over a time interval of size `cDtoH_freq` (see the parameters in the notebook) and copy each time the result back to the CPU where the different time batches are *"glued"* together to form the full trajectories from time `0` until maturity.
 
-CUDA kernels are compiled just-in-time using Numba, which allows to test for various problem sizes without having to recompile any source code at the cost of a very small overhead when instanciating a `DiffusionEngine`. This approach is similar to runtime compilation using `nvrtc` (https://docs.nvidia.com/cuda/nvrtc/) in CUDA C/C++.
+CUDA kernels are compiled just-in-time using Numba, which allows to test for various problem sizes without having to recompile any source code at the cost of a very small overhead when instanciating a `DiffusionEngine`. This approach is similar to runtime compilation using `nvrtc` (https://docs.nvidia.com/cuda/nvrtc/) in CUDA C/C++. As stated previously, it also allows to make some variables (*e.g.* problem sizes) known at compile-time in kernels defined inside Python closures.
 
 As opposed to most machine learning use-cases where the final product is the trained model and only inference is being performed when used by the end-user, in our case the training process itself is part of the final product because the distribution of the training data changes between two uses as the market data from which the diffusion parameters are inferred change. This calls for more care when writing the training procedures as they will be called at each use.
 
-Thus, we chose to implement the learning schemes using PyTorch. This allows for interoperability with custom CUDA kernels or other CUDA-based packages implementing the CUDA Array Interface (*ie* arrays have the `__cuda_array_interface__` attribute). In particular, this allows us to reuse buffers from `DiffusionEngine` (which avoids unnecessary memory allocations) or to use fast cuSOLVER-based linear algebra routines from the `cupy` package on PyTorch tensors. PyTorch also exposes many of the CUDA internals, including whether to use pinned host memory or not. We use it by default to accelerate the data transfers between the CPU and the GPU.
+Thus, we chose to implement the learning schemes using PyTorch. This allows for interoperability with custom CUDA kernels or other CUDA-based packages implementing the CUDA Array Interface (*i.e.* arrays have the `__cuda_array_interface__` attribute). In particular, this allows us to reuse buffers from `DiffusionEngine` (which avoids unnecessary memory allocations) or to use fast cuSOLVER-based linear algebra routines from the `cupy` package on PyTorch tensors. PyTorch also exposes many of the CUDA internals, including whether to use pinned host memory or not. We use it by default to accelerate the data transfers between the CPU and the GPU.
 
 ## Citing
 If you use this code in your work, we strongly encourage you to both cite this Github repository (with the corresponding identifier for the commit you are looking at) and the papers describing our learning schemes:
@@ -51,7 +51,7 @@ num_paths = 2**14
 num_inner_paths = 256
 num_defs_per_path = 128
 ```
-along with a smaller batch size, *ie* `(num_defs_per_path*num_paths)//64` instead of `(num_defs_per_path*num_paths)//32` for example:
+along with a smaller batch size, *i.e.* `(num_defs_per_path*num_paths)//64` instead of `(num_defs_per_path*num_paths)//32` for example:
 ```python
 # learner with default indicators
 cva_estimator_portfolio_def = CVAEstimatorPortfolioDef(prev_reset_arr, True, False, False, diffusion_engine, 
