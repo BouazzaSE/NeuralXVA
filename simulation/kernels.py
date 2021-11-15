@@ -631,9 +631,9 @@ def compile_cuda_nested_cva(irs_batch_size, vanilla_batch_size, g_diff_params, g
                 
                 for i in range(num_cpty):
                     s = tmp_spread_integrals[i+1]
+                    q = i // 8
+                    r = i % 8
                     if indicator_in_cva:
-                        q = i // 8
-                        r = i % 8
                         for j in range(num_defs_per_path):
                             if s > tmp_exp_1[i, j]:
                                 # no common-shock this time
