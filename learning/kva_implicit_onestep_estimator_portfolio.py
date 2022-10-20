@@ -18,98 +18,24 @@
 from learning.generic_estimator import GenericEstimator
 from learning.xva_estimator import XVAEstimatorPortfolio
 import math
-import numba as nb
 from numba import cuda
 import numpy as np
 import torch
 
 
-def compile_cuda_build_labels_backward(num_spreads, num_defs_per_path, num_paths, ntpb, stream):
-    sig = (nb.int8[:, :, :], nb.int8[:, :, :], nb.float32[:], nb.float32[:], nb.float32[:, :], nb.float32[:, :], nb.bool_, nb.bool_)
-
-    @cuda.jit(func_or_sig=sig, max_registers=32)
-    def _build_labels_backward(def_now, def_next, rate_integral_now, rate_integral_next, mtm_next, out, implicit_timestepping, accumulate):
-        block = cuda.blockIdx.x
-        block_size = cuda.blockDim.x
-        tidx = cuda.threadIdx.x
-        pos = tidx + block * block_size
-        # TODO: work on a local array instead of out
-        if pos < num_paths:
-            if not accumulate:
-                for j in range(num_defs_per_path):
-                    out[j, pos] = 0
-            for cpty in range(num_spreads-1):
-                m = mtm_next[cpty, pos]
-                if m < 0:
-                    m = 0
-                q = cpty // 8
-                r = cpty % 8
-                for j in range(num_defs_per_path):
-                    di = (def_next[q, j, pos] ^ def_now[q, j, pos]) & def_next[q, j, pos]
-                    if di & (1 << r):
-                        out[j, pos] += m
-            df_r = math.exp(rate_integral_now[pos] - rate_integral_next[pos])
-            for j in range(num_defs_per_path):
-                out[j, pos] *= df_r
-            if implicit_timestepping:
-                for q in range((num_spreads+6)//8):
-                    for j in range(num_defs_per_path):
-                        def_next[q, j, pos] = def_now[q, j, pos]
-                rate_integral_next[pos] = rate_integral_now[pos]
-    
-    build_labels_backward = _build_labels_backward[(num_paths+ntpb-1)//ntpb, ntpb, stream]
-    
-    return build_labels_backward
-
-def compile_cuda_aggregate_survival(num_spreads, num_defs_per_path, num_paths, ntpb, stream):
-    sig = (nb.float32[:, :, :], nb.int8[:, :, :], nb.float32[:, :])
-
-    @cuda.jit(func_or_sig=sig, max_registers=32)
-    def _aggregate_survival(labels, def_arr, out):
-        block = cuda.blockIdx.x
-        block_size = cuda.blockDim.x
-        tidx = cuda.threadIdx.x
-        pos = tidx + block * block_size
-
-        if pos < num_paths:
-            for i in range(num_defs_per_path):
-                out[i, pos] = 0
-            for cpty in range(num_spreads-1):
-                q = cpty // 8
-                r = cpty % 8
-                mask = 1 << r
-                for i in range(num_defs_per_path):
-                    di = def_arr[q, i, pos] & mask
-                    if not di:
-                        out[i, pos] += labels[cpty, i, pos]
-                        
-    aggregate_survival = _aggregate_survival[(num_paths+ntpb-1)//ntpb, ntpb, stream]
-    
-    return aggregate_survival
-
-def compile_unpack(num_spreads):
-    @nb.jit((nb.int8[:, :, :], nb.float32[:, :, :]), nopython=True, nogil=True)
-    def _unpack(def_arr, out):
-        for cpty in range(num_spreads-1):
-            out[:, :, cpty] = def_arr[cpty//8] & (1 << (cpty%8))
-    return _unpack
-
-_cuda_build_labels_backward_cache = {}
-_cuda_aggregate_survival_cache = {}
-_unpack_cache = {}
-
-class CVAEstimatorPortfolioDef(XVAEstimatorPortfolio):
-    def __init__(self, prev_reset_arr, backward, warmup, compute_loss_surface, *args, **kwargs):
+class KVAImplicitOneStepEstimatorPortfolio(XVAEstimatorPortfolio):
+    def __init__(self, hurdle_rate, ec_term: XVAEstimatorPortfolio, prev_reset_arr, backward, warmup, compute_loss_surface, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_features = 3*self.diffusion_engine.num_rates+2*(self.diffusion_engine.num_spreads-1)-1
+        self.hurdle_rate = hurdle_rate
+        self.ec_term = ec_term
         self.backward = backward
         self.warmup = warmup
         regr_type = 'positive_mean' if not self.linear else 'mean'
         self._estimator = GenericEstimator(self.num_features, self.num_hidden_layers, \
             self.num_hidden_units, self.diffusion_engine.num_defs_per_path*self.diffusion_engine.num_paths, \
                 self.batch_size, self.num_epochs, self.lr, self.holdout_size, self.device, \
-                    regr_type=regr_type, linear=self.linear, best_sol=self.best_sol, \
-                        refine_last_layer=self.refine_last_layer)
+                    regr_type=regr_type, linear=self.linear, best_sol=self.best_sol, refine_last_layer=self.refine_last_layer)
         self.saved_states = [None] * (self.diffusion_engine.num_coarse_steps+1)
         self.prev_reset_arr = prev_reset_arr
         self.compute_loss_surface = compute_loss_surface
@@ -118,26 +44,13 @@ class CVAEstimatorPortfolioDef(XVAEstimatorPortfolio):
         self._compile_kernels()
     
     def _compile_kernels(self):
-        # NOTE: not caring about async kernel launches for now
-        self.__cuda_build_labels_backward = _cuda_build_labels_backward_cache.get((self.diffusion_engine.num_paths, 512, 0))
-        self.__cuda_aggregate_survival = _cuda_aggregate_survival_cache.get((self.diffusion_engine.num_paths, 512, 0))
-        if self.backward:
-            if self.__cuda_build_labels_backward is None:
-                self.__cuda_build_labels_backward = compile_cuda_build_labels_backward(self.diffusion_engine.num_spreads, self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths, 512, 0)
-                _cuda_build_labels_backward_cache[(self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths, 512, 0)] = self.__cuda_build_labels_backward
-        else:
+        if not self.backward:
             raise NotImplementedError
-        if self.__cuda_aggregate_survival is None:
-            self.__cuda_aggregate_survival = compile_cuda_aggregate_survival(self.diffusion_engine.num_spreads, self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths, 512, 0)
-            _cuda_aggregate_survival_cache[(self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths, 512, 0)] = self.__cuda_aggregate_survival
-        self.__unpack = _unpack_cache.get(self.diffusion_engine.num_spreads)
-        if self.__unpack is None:
-            self.__unpack = compile_unpack(self.diffusion_engine.num_spreads)
-            _unpack_cache[self.diffusion_engine.num_spreads] = self.__unpack
+        pass
     
-    def _batch_generator(self, labels_as_cuda_tensors=True, train_mode=False):
+    def _batch_generator(self, labels_as_cuda_tensors=True, load_from_device=False, train_mode=False):
         assert isinstance(self.batch_size, int) and (self.batch_size >= 1) and (not (self.batch_size & (self.batch_size-1)))
-        features_gen = self._features_generator()
+        features_gen = self._features_generator(load_from_device=load_from_device)
         labels_gpu = torch.empty(self.batch_size, 1, dtype=torch.float32, device=self.device)
         labels_gen = self._build_labels(labels_as_cuda_tensors)
         num_defs_per_batch = (self.batch_size+self.diffusion_engine.num_paths-1)//self.diffusion_engine.num_paths
@@ -213,26 +126,17 @@ class CVAEstimatorPortfolioDef(XVAEstimatorPortfolio):
                         yield features_gpu
             yield __gen_features
 
-    def _build_labels(self, as_cuda_tensor=False):
+    def _build_labels(self, as_cuda_tensor=False, load_from_device=False):
         if self.backward:
             return self._build_labels_backward(as_cuda_tensor)
         else:
             raise NotImplementedError
     
     def _build_labels_backward(self, as_cuda_tensor):
-        t_def_now = torch.empty(self.diffusion_engine.d_def_indicators.shape[1:], dtype=torch.int8, device=self.device)
-        t_def_next = torch.empty(self.diffusion_engine.d_def_indicators.shape[1:], dtype=torch.int8, device=self.device)
-        t_mtm_next = torch.empty(self.diffusion_engine.d_mtm_by_cpty.shape[1:], dtype=torch.float32, device=self.device)
-        t_rate_integral_now = torch.empty(self.diffusion_engine.d_dom_rate_integral.shape[1:], dtype=torch.float32, device=self.device)
-        t_rate_integral_next = torch.empty(self.diffusion_engine.d_dom_rate_integral.shape[1:], dtype=torch.float32, device=self.device)
+        kva_predictor = self.predict(as_cuda_array=True, flatten=False, load_from_device=False)
+        rate_integral_now = torch.empty(self.diffusion_engine.num_paths, dtype=torch.float32, device=self.device)
+        rate_integral_next = torch.empty(self.diffusion_engine.num_paths, dtype=torch.float32, device=self.device)
         t_out = torch.empty((self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths), dtype=torch.float32, device=self.device)
-        with cuda.devices.gpus[self.device.index]:
-            d_def_now = cuda.as_cuda_array(t_def_now)
-            d_def_next = cuda.as_cuda_array(t_def_next)
-            d_mtm_next = cuda.as_cuda_array(t_mtm_next)
-            d_rate_integral_now = cuda.as_cuda_array(t_rate_integral_now)
-            d_rate_integral_next = cuda.as_cuda_array(t_rate_integral_next)
-            d_out = cuda.as_cuda_array(t_out)
         if as_cuda_tensor:
             out = t_out
         else:
@@ -242,28 +146,27 @@ class CVAEstimatorPortfolioDef(XVAEstimatorPortfolio):
             yield out.view(-1, 1)
         else:
             yield out.reshape(-1, 1)
-        d_def_next.copy_to_device(self.diffusion_engine.def_indicators[self.diffusion_engine.num_coarse_steps])
-        d_rate_integral_next.copy_to_device(self.diffusion_engine.dom_rate_integral[self.diffusion_engine.num_coarse_steps])
-        accumulate = False
+        rate_integral_next.copy_(torch.as_tensor(self.diffusion_engine.dom_rate_integral[self.diffusion_engine.num_coarse_steps]))
         for t in range(self.diffusion_engine.num_coarse_steps-1, -1, -1):
-            d_def_now.copy_to_device(self.diffusion_engine.def_indicators[t])
-            d_rate_integral_now.copy_to_device(self.diffusion_engine.dom_rate_integral[t])
-            d_mtm_next.copy_to_device(self.diffusion_engine.mtm_by_cpty[t+1])
-            self.__cuda_build_labels_backward(d_def_now, d_def_next, d_rate_integral_now, d_rate_integral_next, d_mtm_next, d_out, t > 0, accumulate)
+            rate_integral_now.copy_(torch.as_tensor(self.diffusion_engine.dom_rate_integral[t]))
+            df = torch.exp(rate_integral_now-rate_integral_next)
+            next(kva_predictor)
+            _xva_next = torch.as_tensor(kva_predictor.send(t+1), dtype=torch.float32, device=self.device)
+            t_out = df*_xva_next
             if as_cuda_tensor:
-                yield out.view(-1, 1)
+                yield t_out.view(-1, 1)
             else:
-                d_out.copy_to_host(out)
-                yield out.reshape(-1, 1)
-            if not accumulate:
-                accumulate = True
-    
+                raise NotImplementedError
+            rate_integral_next.copy_(rate_integral_now)
+
+    def _predict(self, t, features_gen, out):
+        super()._predict(t, features_gen, out)
+        out = torch.as_tensor(out)
+        ec_predictor = self.ec_term.predict(features_gen=features_gen, as_cuda_array=True, flatten=False, load_from_device=False)
+        next(ec_predictor)
+        _ec = torch.as_tensor(ec_predictor.send(t), dtype=torch.float32, device=self.device)
+        out += self.hurdle_rate*self.diffusion_engine.dT/(1+self.hurdle_rate*self.diffusion_engine.dT)*torch.maximum(_ec, out)
+        out *= math.exp(-self.hurdle_rate*self.diffusion_engine.dT)
+
     def _build_loss_backward(self, window):
-        labels_gen_start = self._build_labels_backward(True)
-        labels_gen_end = self._build_labels_backward(True)
-        for t in range(self.diffusion_engine.num_coarse_steps, -1, -1):
-            if t > self.diffusion_engine.num_coarse_steps-window:
-                yield next(labels_gen_start).view(self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths)
-            else:
-                df = (torch.as_tensor(self.diffusion_engine.dom_rate_integral[t], dtype=torch.float32, device=self.device)-torch.as_tensor(self.diffusion_engine.dom_rate_integral[t+window], dtype=torch.float32, device=self.device)).exp_()
-                yield next(labels_gen_start).view(self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths)-next(labels_gen_end).view(self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths)*df[None, :]
+        raise NotImplementedError

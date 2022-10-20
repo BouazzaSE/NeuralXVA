@@ -20,9 +20,11 @@ from copy import deepcopy
 import cupy as cp
 from functools import partial
 from itertools import chain
+from learning.misc import batch_mean, batch_std
 import math
 import numpy as np
 import torch
+from typing import Optional, Tuple
 
 
 def batch_iterate(features, labels, dest_features, dest_labels, batch_size):
@@ -70,10 +72,25 @@ class GenericModelHiddenLayer(torch.jit.ScriptModule):
         super(GenericModelHiddenLayer, self).__init__()
         self.W = torch.nn.Parameter(torch.empty(dim_in, dim_out, dtype=torch.float32))
         self.b = torch.nn.Parameter(torch.empty(1, dim_out, dtype=torch.float32))
-        self.leaky_relu = torch.nn.LeakyReLU()
+        self.activation = torch.nn.Softplus()
+        self.diff_activation = torch.nn.Sigmoid()
 
     def forward(self, x):
-        return self.leaky_relu(torch.matmul(x, self.W) + self.b)
+        z = torch.matmul(x, self.W) + self.b
+        y = self.activation(z)
+        return y
+    
+    @torch.jit.script_method
+    def forward_backward(self, x, only_first_diff: bool):
+        z = torch.matmul(x, self.W) + self.b
+        diff_activation = self.diff_activation(z)
+        if only_first_diff:
+            W = self.W[None, 0]
+        else:
+            W = self.W
+        y = self.activation(z)
+        dy = W[None, :, :] * diff_activation[:, None, :]
+        return y, dy
 
 class GenericModelOutputLayer(torch.jit.ScriptModule):
     __constants__ = ['positive_mean']
@@ -84,7 +101,7 @@ class GenericModelOutputLayer(torch.jit.ScriptModule):
         self.register_buffer('a', torch.tensor(False, dtype=torch.bool))
         self.register_buffer('c', torch.tensor(0, dtype=torch.float32))
 
-        if regr_type in ('mean', 'positive_mean', 'quantile'):
+        if regr_type in ('mean', 'positive_mean', 'quantile', 'es'):
             self.W = torch.nn.Parameter(torch.empty(dim_in, 1, dtype=torch.float32))
             self.b = torch.nn.Parameter(torch.empty(1, 1, dtype=torch.float32))
         elif regr_type == 'quantile_es':
@@ -108,6 +125,95 @@ class GenericModelOutputLayer(torch.jit.ScriptModule):
             if self.a:
                 return torch.relu(y) + self.c
         return y
+    
+    @torch.jit.script_method
+    def forward_backward(self, x):
+        # WARNING, THIS ASSUMES POSITIVE_MEAN = FALSE
+        y = torch.matmul(x, self.W) + self.b
+        dy = self.W[None, :, :]
+        return y, dy
+
+class AffineSoftplus(torch.nn.Module):
+    def __init__(self, dim_in: int, dim_out: int):
+        super().__init__()
+        self.W = torch.nn.Parameter(torch.empty(dim_in, dim_out, dtype=torch.float32))
+        self.b = torch.nn.Parameter(torch.empty(1, dim_out, dtype=torch.float32))
+        self.activation = torch.nn.Softplus()
+        self.diff_activation = torch.nn.Sigmoid()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = torch.matmul(x, self.W) + self.b
+        y = self.activation(z)
+        return y
+    
+    @torch.jit.export
+    def forward_diff(self, x: torch.Tensor, dy_prev: Optional[torch.Tensor], only_first_diff: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = torch.matmul(x, self.W) + self.b
+        diff_activation = self.diff_activation(z).unsqueeze(1)
+        if only_first_diff:
+            W = self.W[0].unsqueeze(0)
+        else:
+            W = self.W
+        W = W.unsqueeze(0)
+        y = self.activation(z)
+        if dy_prev is not None:
+            dy = (dy_prev @ W) * diff_activation
+        else:
+            dy = W * diff_activation
+        return y, dy
+
+class Affine(torch.nn.Module):
+    def __init__(self, dim_in: int, dim_out: int):
+        super().__init__()
+        self.W = torch.nn.Parameter(torch.empty(dim_in, dim_out, dtype=torch.float32))
+        self.b = torch.nn.Parameter(torch.empty(1, dim_out, dtype=torch.float32))
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = torch.matmul(x, self.W) + self.b
+        return y
+    
+    @torch.jit.export
+    def forward_diff(self, x: torch.Tensor, dy_prev: Optional[torch.Tensor], only_first_diff: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        y = torch.matmul(x, self.W) + self.b
+        if only_first_diff:
+            W = self.W[0].unsqueeze(0)
+        else:
+            W = self.W
+        W = W.unsqueeze(0)
+        if dy_prev is not None:
+            dy = dy_prev @ W
+        else:
+            dy = W
+        return y, dy
+    
+class ModelRandomAlphaPiecewiseAffine(torch.nn.Module):
+    def __init__(self, input_dim, num_hidden_layers, num_hidden_units, interpolation_nodes):
+        super().__init__()
+        h = []
+        dim_in = input_dim-1
+        for i in range(num_hidden_layers):
+            h.append(AffineSoftplus(dim_in, num_hidden_units))
+            dim_in = num_hidden_units
+        self.h = torch.nn.ModuleList(h)
+        self.o = Affine(num_hidden_units, interpolation_nodes.shape[0])
+        self.register_buffer('x_mean', torch.zeros(1, input_dim, dtype=torch.float32))
+        self.register_buffer('x_std', torch.ones(1, input_dim, dtype=torch.float32))
+        self.register_buffer('y_mean', torch.zeros(1, 1, dtype=torch.float32))
+        self.register_buffer('y_std', torch.ones(1, 1, dtype=torch.float32))
+        self.register_buffer('interpolation_nodes', interpolation_nodes)
+        self.register_buffer('interpolation_nodes_delta', interpolation_nodes[1:]-interpolation_nodes[:-1])
+        self.init_weights()
+    
+    def init_weights(self):
+        for l in chain(self.h, (self.o,)):
+            torch.nn.init.normal_(l.W, mean=0., std=np.sqrt(1/l.W.shape[0]))
+            torch.nn.init.zeros_(l.b)
+    def forward(self, x):
+        a = (x[:, 1:]-self.x_mean[:, 1:])/self.x_std[:, 1:]
+        for l in self.h:
+            a = l(a)
+        a = self.o(a)
+        a = a[:, 0, None]+((torch.minimum(x[:, 0, None], self.interpolation_nodes[None, 1:])-self.interpolation_nodes[None, :-1])*(self.interpolation_nodes[None, :-1]>=x[:, 0, None])*a[:, 1:]/self.interpolation_nodes_delta[None, :]).sum(1, keepdim=True)
+        return a*self.y_std+self.y_mean
 
 class GenericModel(torch.jit.ScriptModule):
     def __init__(self, input_dim, num_hidden_layers, num_hidden_units, regr_type):
@@ -135,6 +241,17 @@ class GenericModel(torch.jit.ScriptModule):
         for l in self.h:
             a = l(a)
         return self.o(a)
+    
+    @torch.jit.script_method
+    def forward_backward(self, x):
+        # DON'T FORGET TO DIVIDE THE FINAL DIFFS BY STD_X & MULTIPLY WITH STD_Y !
+        a, da = self.h[0].forward_backward(x, True)
+        for l in self.h[1:]:
+            a, l_da = l.forward_backward(a, False)
+            da = da @ l_da
+        a, l_da = self.o.forward_backward(a)
+        da = da @ l_da
+        return a, da
 
 class GenericLinearModel(torch.jit.ScriptModule):
     def __init__(self, input_dim, regr_type):
@@ -180,11 +297,22 @@ def _vares_loss(alpha, y_pred, y_true):
 def _var_loss(alpha, y_pred, y_true):
     return torch.mean(torch.relu(y_true-y_pred)+alpha*y_pred)
 
+@torch.jit.script
+def _multiple_var_loss(alphas, y_pred, y_true):
+    return torch.mean(torch.relu(y_true-y_pred)+alphas*y_pred)
+@torch.jit.script
+def _multiple_var_monotonicity_penalty(dy_pred):
+    return torch.mean(torch.relu(dy_pred))
+
 class GenericEstimator:
     def __init__(self, input_dim, num_hidden_layers, num_hidden_units, num_samples, batch_size, num_epochs, \
-                lr, holdout_size, device, regr_type='mean', var_es_level=None, linear=False, best_sol=True):
+                lr, holdout_size, device, regr_type='mean', var_es_level=None, linear=False, best_sol=True, \
+                refine_last_layer=True, multiple_var=False, interpolation_nodes=None, monotonicity_penalty=0.01):
         if not linear:
-            self.model = GenericModel(input_dim, num_hidden_layers, num_hidden_units, regr_type)
+            if interpolation_nodes is not None:
+                self.model = ModelRandomAlphaPiecewiseAffine(input_dim, num_hidden_layers, num_hidden_units, interpolation_nodes)
+            else:
+                self.model = GenericModel(input_dim, num_hidden_layers, num_hidden_units, regr_type)
         else:
             self.model = GenericLinearModel(input_dim, regr_type)
         self.linear = linear
@@ -203,69 +331,40 @@ class GenericEstimator:
             self._loss_fct = _mse_loss
             self._loss_fct_pointwise = _mse_loss_pointwise
             self._weighted_loss_fct = _weighted_mse_loss
-        elif regr_type == 'quantile':
+        elif regr_type in ('quantile', 'es'):
             self._loss_fct = partial(_var_loss, var_es_level)
         elif regr_type == 'quantile_es':
             self._loss_fct = partial(_vares_loss, var_es_level)
         else:
             raise NotImplementedError
+        self.var_es_level = var_es_level
         self.best_sol = best_sol
+        self.refine_last_layer = refine_last_layer
+        self.multiple_var = multiple_var
+        self.piecewise_affine_var = interpolation_nodes is not None
+        self.monotonicity_penalty = monotonicity_penalty
         # TODO: move the following line to self.train and add a flag to specify whether we want that or not
         self.loss_hist = np.empty(num_epochs, dtype=np.float32)
         # INFO: no need to have num_samples and holdout_size in constructor
         # TODO: move the following to self.train and remove num_samples and holdout_size from the constructor
         self.total_iter = num_epochs*((num_samples-holdout_size+batch_size-1)//batch_size)
     
-    def train(self, features, labels, shuffle=False, weights=None, max_iter=None, compute_heuristic=False, num_paths=None, valid_loss=True):
-        t_features = torch.as_tensor(features)
-        t_features_train = t_features[:self.num_samples-self.holdout_size]
-        t_features_holdout = t_features[self.num_samples-self.holdout_size:]
-        t_features_batch = torch.empty((self.batch_size, features.shape[1]), dtype=torch.float32, device=self.device)
-        t_labels = torch.as_tensor(labels)
-        t_labels_train = t_labels[:self.num_samples-self.holdout_size]
-        t_labels_holdout = t_labels[self.num_samples-self.holdout_size:]
-        t_labels_batch = torch.empty((self.batch_size, t_labels.shape[1]), dtype=torch.float32, device=self.device)
-        
-        if weights is not None:
-            t_weights = torch.as_tensor(weights)
-            t_weights_train = t_weights[:self.num_samples-self.holdout_size]
-            weights_train_sum = t_weights_train.sum()
-            t_weights_holdout = t_weights[self.num_samples-self.holdout_size:]
-            weights_holdout_sum = t_weights_train.sum()
-            t_weights_batch = torch.empty(self.batch_size, dtype=torch.float32, device=self.device)
-        else:
-            t_weights_train = None
-            t_weights_holdout = None
-            t_weights_batch = None
-
-        self.t_features_mean = torch.empty(features.shape[1], dtype=torch.float32, device=self.device)
-        self.t_features_std = torch.empty(features.shape[1], dtype=torch.float32, device=self.device)
-        self.t_labels_meanstd = torch.empty(labels.shape[1], dtype=torch.float32, device=self.device)
-        self.t_labels_std = torch.empty(labels.shape[1], dtype=torch.float32, device=self.device)
-        self.t_features_mean.zero_()
-        self.t_features_std.zero_()
-        self.t_labels_meanstd.zero_()
-        self.t_labels_std.zero_()
-        for _, eff_batch_size, features_batch, labels_batch, weights_batch in weighted_batch_iterate(t_features_train, t_labels_train, t_weights_train, t_features_batch, t_labels_batch, t_weights_batch, self.batch_size):
-            self.t_features_mean += torch.mean(features_batch, 0)*eff_batch_size/t_features_train.shape[0]
-            self.t_features_std += torch.var(features_batch, 0)*eff_batch_size/t_features_train.shape[0]
-            if weights_batch is None:
-                self.t_labels_meanstd += torch.mean(labels_batch, 0)*eff_batch_size/t_labels_train.shape[0]
-                self.t_labels_std += torch.var(labels_batch, 0)*eff_batch_size/t_labels_train.shape[0]
-            else:
-                self.t_labels_meanstd += torch.sum(labels_batch*weights_batch.view(-1, 1), 0)/weights_train_sum
-                self.t_labels_std += torch.var(labels_batch*torch.sqrt(weights_batch.view(-1, 1)), 0)*eff_batch_size/weights_train_sum
-        self.t_features_std.sqrt_()
-        self.t_labels_std.sqrt_()
-        self.t_labels_meanstd /= self.t_labels_std
+    def train(self, features_gen, labels_gen, max_iter=None, compute_heuristic=False, num_paths=None, valid_loss=False):
+        # TODO: merge batch_mean & batch_std to avoid redundant copies
+        self.t_features_mean = batch_mean(features_gen())
+        self.t_features_std = batch_std(features_gen())
+        self.t_labels_std = batch_std(labels_gen())
+        self.t_labels_meanstd = batch_mean(labels_gen())/self.t_labels_std
 
         if compute_heuristic:
+            raise NotImplementedError
+            # TODO: fix the following and account for the new batch generator
             _t_features_holdout_reshaped = torch.reshape(t_features_holdout, (-1, num_paths, features.shape[1]))
             _t_labels_holdout_reshaped = torch.reshape(t_labels_holdout, (-1, num_paths, labels.shape[1]))
-            t_features_h_1 = (_t_features_holdout_reshaped[1].cuda(self.device)-self.t_features_mean[None])/(self.t_features_std[None] + 1e-16)
-            t_labels_h_1 = _t_labels_holdout_reshaped[1].cuda(self.device)/(self.t_labels_std[None] + 1e-16)
-            t_features_h_2 = (_t_features_holdout_reshaped[2].cuda(self.device)-self.t_features_mean[None])/(self.t_features_std[None] + 1e-16)
-            t_labels_h_2 = _t_labels_holdout_reshaped[2].cuda(self.device)/(self.t_labels_std[None] + 1e-16)
+            t_features_h_1 = (_t_features_holdout_reshaped[1].cuda(self.device)-self.t_features_mean[None])/(self.t_features_std[None] + 1e-7)
+            t_labels_h_1 = _t_labels_holdout_reshaped[1].cuda(self.device)/(self.t_labels_std[None] + 1e-7)
+            t_features_h_2 = (_t_features_holdout_reshaped[2].cuda(self.device)-self.t_features_mean[None])/(self.t_features_std[None] + 1e-7)
+            t_labels_h_2 = _t_labels_holdout_reshaped[2].cuda(self.device)/(self.t_labels_std[None] + 1e-7)
 
         best_loss = math.inf
 
@@ -273,7 +372,7 @@ class GenericEstimator:
         i = 0
 
         if not self.linear:
-            if self.regr_type in ('mean', 'positive_mean'):
+            if self.regr_type in ('mean', 'positive_mean', 'es'):
                 h_aug = torch.empty((self.batch_size, self.model.o.W.shape[0]+1), dtype=torch.float32, device=self.device)
                 h_aug[:, 0] = 1
                 if self.regr_type == 'positive_mean':
@@ -283,25 +382,13 @@ class GenericEstimator:
         for e in range(self.num_epochs):
             if i==max_iter:
                 break
-
             self.model.train()
-            
-            if shuffle:
-                # slow, because of non-contiguity
-                p = torch.randperm(t_features.shape[0])
-                t_features_shuffled = t_features_train[p]
-                t_labels_shuffled = t_labels_train[p]
-                t_weights_shuffled = t_weights_train[p]
-            else:
-                # faster, no shuffling
-                t_features_shuffled = t_features_train
-                t_labels_shuffled = t_labels_train
-                t_weights_shuffled = t_weights_train
-            
-            for _, _, features_batch, labels_batch, weights_batch in weighted_batch_iterate(t_features_shuffled, t_labels_shuffled, t_weights_shuffled, t_features_batch, t_labels_batch, t_weights_batch, self.batch_size):
+            for features_batch, labels_batch in zip(features_gen(self.t_features_mean, self.t_features_std), labels_gen(None, self.t_labels_std)):
                 if i==max_iter:
                     break
                 if compute_heuristic:
+                    raise NotImplementedError
+                    # TODO: fix the following and account for the new batch generator
                     with torch.no_grad():
                         _f1 = self._loss_fct_pointwise(self.model(t_features_h_1), t_labels_h_1)
                         _f2 = self._loss_fct_pointwise(self.model(t_features_h_2), t_labels_h_2)
@@ -311,19 +398,20 @@ class GenericEstimator:
                         _m_f1f2 = (_f1*_f2).mean().item()
                         try:
                             print('[i={}] "optimal" N = {}, _m_f0f0 = {}, _m_f1f2 = {}, _m_f0_sq = {}, _var = {}'.format(i, \
-                                np.sqrt((abs(_m_f0f0-_m_f1f2)+1e-16)/(abs(_m_f0_sq-_m_f1f2)+1e-16)), _m_f0f0, _m_f1f2, _m_f0_sq, _var))
+                                np.sqrt((abs(_m_f0f0-_m_f1f2)+1e-7)/(abs(_m_f0_sq-_m_f1f2)+1e-7)), _m_f0f0, _m_f1f2, _m_f0_sq, _var))
                         except:
                             print(_m_f0f0, _m_f1f2, _m_f0_sq, _m_f1f2)
                             raise
-                
-                features_batch -= self.t_features_mean[None]
-                features_batch /= (self.t_features_std[None] + 1e-16)
-                labels_batch /= (self.t_labels_std[None] + 1e-16)
-                y_pred = self.model(features_batch)
-                if weights_batch is None:
+                if self.multiple_var and (not self.piecewise_affine_var):
+                    y_pred, dy_pred = self.model.forward_backward(features_batch)
+                else:
+                    y_pred = self.model(features_batch)
+                if not self.multiple_var:
                     loss = self._loss_fct(y_pred, labels_batch)
                 else:
-                    loss = self._weighted_loss_fct(y_pred, labels_batch, weights_batch)
+                    loss = _multiple_var_loss((features_batch[:, 0]*self.t_features_std[0]+self.t_features_mean[0])[:, None], y_pred, labels_batch)
+                    if not self.piecewise_affine_var:
+                        loss = loss + self.monotonicity_penalty*_multiple_var_monotonicity_penalty(dy_pred)
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
@@ -333,28 +421,31 @@ class GenericEstimator:
                 self.model.eval()
                 total_loss = 0
                 update_c = False
+                if self.multiple_var:
+                    total_monotonicity_penalty = 0
 
                 if (not self.linear) and (self.regr_type in ('mean', 'positive_mean')):
                     if e == self.num_epochs//2:
-                        j = 0
-                        self.model.o.W.zero_()
-                        self.model.o.b.zero_()
-                        for _, eff_batch_size, features_batch, labels_batch, weights_batch in weighted_batch_iterate(t_features_shuffled, t_labels_shuffled, t_weights_shuffled, t_features_batch, t_labels_batch, t_weights_batch, self.batch_size):
-                            features_batch -= self.t_features_mean[None]
-                            features_batch /= (self.t_features_std[None] + 1e-16)
-                            labels_batch /= (self.t_labels_std[None] + 1e-16)
-                            h = features_batch
-                            for l in self.model.h:
-                                h = l(h)
-                            h_aug[:eff_batch_size, 1:] = h
-                            with cp.cuda.Device(self.device.index):
-                                sol, _, _, _ = cp.linalg.lstsq(cp.asarray(h_aug[:eff_batch_size]), cp.asarray(labels_batch), rcond=None)
-                                sol = torch.as_tensor(sol, device=self.device)
-                            self.model.o.W.add_(sol[1:h_aug.shape[1]])
-                            self.model.o.b.add_(sol[:1])
-                            j += 1
-                        self.model.o.W /= j
-                        self.model.o.b /= j
+                        if self.refine_last_layer:
+                            j = 0
+                            self.model.o.W.zero_()
+                            self.model.o.b.zero_()
+                            for features_batch, labels_batch in zip(features_gen(self.t_features_mean, self.t_features_std), labels_gen(None, self.t_labels_std)):
+                                # features_batch -= self.t_features_mean[None]
+                                # features_batch /= (self.t_features_std[None] + 1e-16)
+                                # labels_batch /= (self.t_labels_std[None] + 1e-16)
+                                h = features_batch
+                                for l in self.model.h:
+                                    h = l(h)
+                                h_aug[:, 1:] = h
+                                with cp.cuda.Device(self.device.index):
+                                    sol, _, _, _ = cp.linalg.lstsq(cp.asarray(h_aug), cp.asarray(labels_batch), rcond=None)
+                                    sol = torch.as_tensor(sol, device=self.device)
+                                self.model.o.W.add_(sol[1:h_aug.shape[1]])
+                                self.model.o.b.add_(sol[:1])
+                                j += 1
+                            self.model.o.W /= j
+                            self.model.o.b /= j
                         if self.regr_type == 'positive_mean':
                             self.model.o._activate_relu()
                     
@@ -366,30 +457,40 @@ class GenericEstimator:
                 if (e < self.num_epochs//2) and (not self.linear) and (self.regr_type=='positive_mean'):
                     self.model.o._activate_relu()
 
-                for _, eff_batch_size, features_batch, labels_batch, weights_batch in weighted_batch_iterate(t_features_train, t_labels_train, t_weights_train, t_features_batch, t_labels_batch, t_weights_batch, self.batch_size):
-                    features_batch -= self.t_features_mean[None]
-                    features_batch /= (self.t_features_std[None] + 1e-16)
-                    labels_batch /= (self.t_labels_std[None] + 1e-16)
-                    y_pred = self.model(features_batch)
-                    if weights_batch is None:
-                        total_loss += self._loss_fct(y_pred, labels_batch)*eff_batch_size/t_features_train.shape[0]
-                        if update_c:
-                            y_pred_mean += y_pred.sum(0)/t_features_train.shape[0]
+                k = 1
+                for features_batch, labels_batch in zip(features_gen(self.t_features_mean, self.t_features_std), labels_gen(None, self.t_labels_std)):
+                    if self.multiple_var and (not self.piecewise_affine_var):
+                        y_pred, dy_pred = self.model.forward_backward(features_batch)
                     else:
-                        weights_batch_sum = weights_batch.sum()
-                        total_loss += self._weighted_loss_fct(y_pred, labels_batch, weights_batch)*weights_batch_sum/weights_train_sum
-                        if update_c:
-                            y_pred_mean += (y_pred * weights_batch.view(-1, 1)).sum(0)/weights_train_sum
+                        y_pred = self.model(features_batch)
+                    total_loss += self._loss_fct(y_pred, labels_batch) #
+                    if not self.multiple_var:
+                        total_loss += self._loss_fct(y_pred, labels_batch)
+                    else:
+                        total_loss += _multiple_var_loss((features_batch[:, 0]*self.t_features_std[0]+self.t_features_mean[0])[:, None], y_pred, labels_batch)
+                        if not self.piecewise_affine_var:
+                            total_monotonicity_penalty += self.monotonicity_penalty*_multiple_var_monotonicity_penalty(dy_pred)
+                    if update_c:
+                        y_pred_mean += y_pred.sum(0) #
+                    k += 1
+                total_loss /= k
                 if update_c:
+                    y_pred_mean /= k
                     bias_adj = torch.relu_(self.model.o.c + (self.t_labels_meanstd - y_pred_mean).view(self.model.o.c.shape))-self.model.o.c
                     self.model.o.c += bias_adj
                 total_loss = total_loss.item()
+                if self.multiple_var and (not self.piecewise_affine_var):
+                    total_monotonicity_penalty = total_monotonicity_penalty.item() / k
+                    total_loss += total_monotonicity_penalty
+                    # TODO: do the same for the holdout version
                 if self.holdout_size > 0:
+                    raise NotImplementedError
+                    # TODO: fix the following and account for the new batch generator
                     total_validation_loss = 0
                     for _, eff_batch_size, features_batch, labels_batch, weights_batch in weighted_batch_iterate(t_features_holdout, t_labels_holdout, t_weights_holdout, t_features_batch, t_labels_batch, t_weights_batch, self.batch_size):
-                        features_batch -= self.t_features_mean[None]
-                        features_batch /= (self.t_features_std[None] + 1e-16)
-                        labels_batch /= (self.t_labels_std[None] + 1e-16)
+                        # features_batch -= self.t_features_mean[None]
+                        # features_batch /= (self.t_features_std[None] + 1e-16)
+                        # labels_batch /= (self.t_labels_std[None] + 1e-16)
                         if weights_batch is None:
                             total_validation_loss += self._loss_fct(self.model(features_batch), labels_batch)*eff_batch_size/t_features_holdout.shape[0]
                         else:
@@ -416,23 +517,34 @@ class GenericEstimator:
         if self.best_sol:
             self.model.load_state_dict(best_model_state)
             self.optimizer.load_state_dict(best_optimizer_state)
+
+        # if (not self.linear) and (self.regr_type=='es'):
+        #     j = 0
+        #     t_labels_std = batch_std(((y-self.model(x)).relu_().div_(self.alpha).add(self.model(x)) for x, y in zip(features_gen(self.t_features_mean, self.t_features_std), labels_gen(None, self.t_labels_std))))
+        #     self.model.o.W.zero_()
+        #     self.model.o.b.zero_()
+        #     for features_batch, labels_batch in zip(features_gen(self.t_features_mean, self.t_features_std), labels_gen(None, self.t_labels_std)):
+        #         h = features_batch
+        #         for l in self.model.h:
+        #             h = l(h)
+        #         h_aug[:, 1:] = h
+        #         with cp.cuda.Device(self.device.index):
+        #             sol, _, _, _ = cp.linalg.lstsq(cp.asarray(h_aug), cp.asarray(labels_batch), rcond=None)
+        #             sol = torch.as_tensor(sol, device=self.device)
+        #         self.model.o.W.add_(sol[1:h_aug.shape[1]])
+        #         self.model.o.b.add_(sol[:1])
+        #         j += 1
+        #     self.model.o.W /= j
+        #     self.model.o.b /= j
     
-    def predict(self, features, out=None):
-        batch_size = min(self.batch_size, features.shape[0])
-        t_features = torch.as_tensor(features)
-        t_features_batch = torch.empty((batch_size, features.shape[1]), dtype=torch.float32, device=self.device)
-        if out is None:
-            out = np.empty((features.shape[0], self.t_labels_std.shape[0]), np.float32)
-        else:
-            assert out.shape==(features.shape[0], self.t_labels_std.shape[0]), 'wrong shape for given output array'
-            assert out.dtype in (np.float32, torch.float32), 'wrong dtype for given output array'
+    def predict(self, features_gen, out):
+        assert out.shape[1]==self.t_labels_std.shape[0], 'wrong shape for given output array'
+        assert out.dtype in (np.float32, torch.float32), 'wrong dtype for given output array'
         t_out = torch.as_tensor(out)
         with torch.no_grad():
             self.model.eval()
-            for start_idx, eff_batch_size, features_batch in batch_iterate_features(t_features, t_features_batch, self.batch_size):
-                features_batch -= self.t_features_mean[None]
-                features_batch /= (self.t_features_std[None] + 1e-16)
-                t_out[start_idx:start_idx+eff_batch_size].copy_(self.model(features_batch)*(self.t_labels_std[None] + 1e-16))
+            for i, features_batch in enumerate(features_gen(self.t_features_mean, self.t_features_std)):
+                t_out[i*self.batch_size:(i+1)*self.batch_size].copy_(self.model(features_batch)*(self.t_labels_std[None] + 1e-7))
         return out
     
     def get_state(self, to_host=False):

@@ -52,7 +52,6 @@ def compile_cuda_build_labels_backward(num_spreads, num_paths, ntpb, stream):
             if implicit_timestepping:
                 rate_integral_next[pos] = rate_integral_now[pos]
     
-    _build_labels_backward._func.get().cache_config(prefer_cache=True)
     build_labels_backward = _build_labels_backward[(num_paths+ntpb-1)//ntpb, ntpb, stream]
     
     return build_labels_backward
@@ -79,7 +78,6 @@ def compile_cuda_aggregate_survival(num_spreads, num_defs_per_path, num_paths, n
                     if not di:
                         out[i, pos] += labels[cpty, pos]
     
-    _aggregate_survival._func.get().cache_config(prefer_cache=True)
     aggregate_survival = _aggregate_survival[(num_paths+ntpb-1)//ntpb, ntpb, stream]
     
     return aggregate_survival
@@ -105,7 +103,7 @@ class CVAEstimatorPortfolioInt(XVAEstimatorPortfolio):
         self._estimator = GenericEstimator(self.num_features, self.num_hidden_layers, \
             self.num_hidden_units, self.diffusion_engine.num_defs_per_path*self.diffusion_engine.num_paths, \
                 self.batch_size, self.num_epochs, self.lr, self.holdout_size, self.device, \
-                    regr_type=regr_type, linear=self.linear, best_sol=self.best_sol)
+                    regr_type=regr_type, linear=self.linear, best_sol=self.best_sol, refine_last_layer=self.refine_last_layer)
         self.saved_states = [None] * (self.diffusion_engine.num_coarse_steps+1)
         self.prev_reset_arr = prev_reset_arr
         self.compute_loss_surface = compute_loss_surface
@@ -131,24 +129,125 @@ class CVAEstimatorPortfolioInt(XVAEstimatorPortfolio):
             self.__unpack = compile_unpack(self.diffusion_engine.num_spreads)
             _unpack_cache[self.diffusion_engine.num_spreads] = self.__unpack
     
-    def _build_features(self):
-        features = cuda.pinned_array((self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths, self.num_features), dtype=np.float32)
+    def _batch_generator(self, labels_as_cuda_tensors=True, train_mode=False):
+        assert isinstance(self.batch_size, int) and (self.batch_size >= 1) and (not (self.batch_size & (self.batch_size-1)))
+        features_gen = self._features_generator()
+        labels_gpu = torch.empty(self.batch_size, 1, dtype=torch.float32, device=self.device)
+        labels_gen = self._build_labels(labels_as_cuda_tensors)
+        num_defs_per_batch = (self.batch_size+self.diffusion_engine.num_paths-1)//self.diffusion_engine.num_paths
+        batch_size = min(self.batch_size, self.diffusion_engine.num_paths)
+        if self.backward:
+            timesteps = range(self.diffusion_engine.num_coarse_steps, -1, -1)
+        else:
+            timesteps = range(self.diffusion_engine.num_coarse_steps+1)
+        for t in timesteps:
+            next(features_gen)
+            __gen_features = features_gen.send(t)
+            labels = next(labels_gen).view(self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths, 1)
+            def __gen_labels(mean=None, std=None):
+                nonlocal labels_gpu
+                for i in range((self.diffusion_engine.num_paths+batch_size-1)//batch_size):
+                    for j in range((self.diffusion_engine.num_defs_per_path+num_defs_per_batch-1)//num_defs_per_batch):
+                        labels_gpu.copy_(labels[j*num_defs_per_batch: (j+1)*num_defs_per_batch, i*batch_size:(i+1)*batch_size].view(-1, 1))
+                        if mean is not None:
+                            labels_gpu -= mean[None]
+                        if std is not None:
+                            labels_gpu /= (std[None] + 1e-7)
+                        yield labels_gpu
+            yield t, __gen_features, __gen_labels
+    
+    # def _features_generator(self):
+    #     assert isinstance(self.batch_size, int) and (self.batch_size >= 1) and (not (self.batch_size & (self.batch_size-1)))
+    #     num_cpty = self.diffusion_engine.num_spreads-1
+    #     features_gpu = torch.empty(self.batch_size, self.num_features, dtype=torch.float32, device=self.device)
+    #     def_indicators_gpu = torch.empty(self.batch_size, (num_cpty+7)//8, dtype=torch.uint8, device=self.device)
+    #     _cpty_idx = np.arange(num_cpty, dtype=np.int32)
+    #     _cpty_mask = torch.tensor(1 << (_cpty_idx[None, :] % 8), device=self.device)
+    #     num_defs_per_batch = (self.batch_size+self.diffusion_engine.num_paths-1)//self.diffusion_engine.num_paths
+    #     batch_size = min(self.batch_size, self.diffusion_engine.num_paths)
+    #     while True:
+    #         t = yield
+    #         X = torch.as_tensor(self.diffusion_engine.X[t])
+    #         t_prev_reset = self.prev_reset_arr[t]
+    #         X_prev = torch.as_tensor(self.diffusion_engine.X[t_prev_reset])
+    #         def_indicators = torch.as_tensor(self.diffusion_engine.def_indicators[t])
+    #         def __gen_features(mean=None, std=None):
+    #             nonlocal features_gpu
+    #             for i in range((self.diffusion_engine.num_paths+batch_size-1)//batch_size):
+    #                 features_gpu[:batch_size, :2*self.diffusion_engine.num_rates-1].copy_(X[:2*self.diffusion_engine.num_rates-1, i*batch_size:(i+1)*batch_size].T)
+    #                 features_gpu[:batch_size, 2*self.diffusion_engine.num_rates-1:2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2].copy_(X[2*self.diffusion_engine.num_rates:2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-1, i*batch_size:(i+1)*batch_size].T)
+    #                 features_gpu[:batch_size, 2*self.diffusion_engine.num_rates-1:2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2].relu_()
+    #                 if t_prev_reset > 0:
+    #                     features_gpu[:batch_size, 2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2].copy_(X_prev[:self.diffusion_engine.num_rates, i*batch_size:(i+1)*batch_size].T)
+    #                 else:
+    #                     features_gpu[:batch_size, 2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2].zero_()
+    #                 if mean is not None:
+    #                     features_gpu[:batch_size, :2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2] -= mean[None, :2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2]
+    #                 if std is not None:
+    #                     features_gpu[:batch_size, :2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2] /= (std[None, :2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2] + 1e-16)
+    #                 for j in range(1, num_defs_per_batch):
+    #                     features_gpu[j*batch_size:(j+1)*batch_size].copy_(features_gpu[:batch_size])
+    #                 for j in range((self.diffusion_engine.num_defs_per_path+num_defs_per_batch-1)//num_defs_per_batch):
+    #                     def_indicators_gpu.copy_(def_indicators[:, j*num_defs_per_batch: (j+1)*num_defs_per_batch, i*batch_size:(i+1)*batch_size].view(def_indicators.shape[0], -1).T)
+    #                     features_gpu[:, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:].copy_((def_indicators_gpu[:, _cpty_idx//8] & _cpty_mask) != 0)
+    #                     if mean is not None:
+    #                         features_gpu[:, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:] -= mean[None, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:]
+    #                     if std is not None:
+    #                         features_gpu[:, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:] /= (std[None, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:] + 1e-16)
+    #                     yield features_gpu
+    #         yield __gen_features
+    
+    def _features_generator(self, load_from_device=False):
+        assert isinstance(self.batch_size, int) and (self.batch_size >= 1) and (not (self.batch_size & (self.batch_size-1)))
+        num_cpty = self.diffusion_engine.num_spreads-1
+        features_gpu = torch.empty(self.batch_size, self.num_features, dtype=torch.float32, device=self.device)
+        def_indicators_gpu = torch.empty(self.batch_size, (num_cpty+7)//8, dtype=torch.uint8, device=self.device)
+        _cpty_idx = np.arange(num_cpty, dtype=np.int32)
+        _cpty_mask = torch.tensor(1 << (_cpty_idx[None, :] % 8), device=self.device)
+        num_defs_per_batch = (self.batch_size+self.diffusion_engine.num_paths-1)//self.diffusion_engine.num_paths
+        batch_size = min(self.batch_size, self.diffusion_engine.num_paths)
         while True:
             t = yield
             t_prev_reset = self.prev_reset_arr[t]
-            features[:, :, :2*self.diffusion_engine.num_rates-1] = self.diffusion_engine.X[t, :2*self.diffusion_engine.num_rates-1].T[None]
-            np.maximum(
-                self.diffusion_engine.X[t, 2*self.diffusion_engine.num_rates:2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-1].T[None], 
-                0., 
-                out=features[:, :, 2*self.diffusion_engine.num_rates-1:2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2]
-            )
-            if t_prev_reset > 0:
-                features[:, :, 2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2] = self.diffusion_engine.X[t_prev_reset, :self.diffusion_engine.num_rates].T[None]
+            if t_prev_reset == 0:
+                t_prev_reset = t
+            if load_from_device:
+                X = torch.as_tensor(self.diffusion_engine.d_X[self.diffusion_engine.max_coarse_per_reset], device=self.device)
+                # very messy
+                # TODO: clean this up
+                shift = (t-1) % self.diffusion_engine.max_coarse_per_reset + 1
+                X_prev = torch.as_tensor(self.diffusion_engine.d_X[self.diffusion_engine.max_coarse_per_reset-shift], device=self.device)
+                def_indicators = torch.as_tensor(self.diffusion_engine.d_def_indicators[1])
             else:
-                features[:, :, 2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2] = 0
-            self.__unpack(self.diffusion_engine.def_indicators[t], features[:, :, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:])
-            yield features.reshape(self.diffusion_engine.num_defs_per_path*self.diffusion_engine.num_paths, -1)
-    
+                X = torch.as_tensor(self.diffusion_engine.X[t])
+                X_prev = torch.as_tensor(self.diffusion_engine.X[t_prev_reset])
+                def_indicators = torch.as_tensor(self.diffusion_engine.def_indicators[t])
+            def __gen_features(mean=None, std=None):
+                nonlocal features_gpu
+                for i in range((self.diffusion_engine.num_paths+batch_size-1)//batch_size):
+                    features_gpu[:batch_size, :2*self.diffusion_engine.num_rates-1].copy_(X[:2*self.diffusion_engine.num_rates-1, i*batch_size:(i+1)*batch_size].T)
+                    features_gpu[:batch_size, 2*self.diffusion_engine.num_rates-1:2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2].copy_(X[2*self.diffusion_engine.num_rates:2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-1, i*batch_size:(i+1)*batch_size].T)
+                    features_gpu[:batch_size, 2*self.diffusion_engine.num_rates-1:2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2].relu_()
+                    if t > 0:
+                        features_gpu[:batch_size, 2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2].copy_(X_prev[:self.diffusion_engine.num_rates, i*batch_size:(i+1)*batch_size].T)
+                    else:
+                        features_gpu[:batch_size, 2*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2].zero_()
+                    if mean is not None:
+                        features_gpu[:batch_size, :3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2] -= mean[None, :3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2]
+                    if std is not None:
+                        features_gpu[:batch_size, :3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2] /= (std[None, :3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2] + 1e-7)
+                    for j in range(1, num_defs_per_batch):
+                        features_gpu[j*batch_size:(j+1)*batch_size].copy_(features_gpu[:batch_size])
+                    for j in range((self.diffusion_engine.num_defs_per_path+num_defs_per_batch-1)//num_defs_per_batch):
+                        def_indicators_gpu.copy_(def_indicators[:, j*num_defs_per_batch: (j+1)*num_defs_per_batch, i*batch_size:(i+1)*batch_size].view(def_indicators.shape[0], -1).T)
+                        features_gpu[:, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:].copy_((def_indicators_gpu[:, _cpty_idx//8] & _cpty_mask) != 0)
+                        if mean is not None:
+                            features_gpu[:, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:] -= mean[None, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:]
+                        if std is not None:
+                            features_gpu[:, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:] /= (std[None, 3*self.diffusion_engine.num_rates+self.diffusion_engine.num_spreads-2:] + 1e-7)
+                        yield features_gpu
+            yield __gen_features
+
     def _build_labels(self, as_cuda_tensor=False):
         if self.backward:
             return self._build_labels_backward(as_cuda_tensor)
@@ -156,15 +255,22 @@ class CVAEstimatorPortfolioInt(XVAEstimatorPortfolio):
             raise NotImplementedError
     
     def _build_labels_backward(self, as_cuda_tensor):
-        d_spread_integral_now = self.diffusion_engine.d_spread_integrals[0, 1:]
-        d_spread_integral_next = self.diffusion_engine.d_spread_integrals[1, 1:]
-        d_mtm_next = self.diffusion_engine.d_mtm_by_cpty[0]
-        d_rate_integral_now = self.diffusion_engine.d_dom_rate_integral[0]
-        d_rate_integral_next = self.diffusion_engine.d_dom_rate_integral[1]
-        d_def = self.diffusion_engine.d_def_indicators[0]
-        d_labels_by_cpty = self.diffusion_engine.d_mtm_by_cpty[1]
+        t_spread_integral_now = torch.empty((self.diffusion_engine.num_spreads-1, self.diffusion_engine.num_paths), dtype=torch.float32, device=self.device)
+        t_spread_integral_next = torch.empty((self.diffusion_engine.num_spreads-1, self.diffusion_engine.num_paths), dtype=torch.float32, device=self.device)
+        t_mtm_next = torch.empty(self.diffusion_engine.d_mtm_by_cpty.shape[1:], dtype=torch.float32, device=self.device)
+        t_rate_integral_now = torch.empty(self.diffusion_engine.d_dom_rate_integral.shape[1:], dtype=torch.float32, device=self.device)
+        t_rate_integral_next = torch.empty(self.diffusion_engine.d_dom_rate_integral.shape[1:], dtype=torch.float32, device=self.device)
+        t_def = torch.empty(self.diffusion_engine.d_def_indicators.shape[1:], dtype=torch.int8, device=self.device)
+        t_labels_by_cpty = torch.empty(self.diffusion_engine.d_mtm_by_cpty.shape[1:], dtype=torch.float32, device=self.device)
         t_out = torch.empty((self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths), dtype=torch.float32, device=self.device)
         with cuda.devices.gpus[self.device.index]:
+            d_spread_integral_now = cuda.as_cuda_array(t_spread_integral_now)
+            d_spread_integral_next = cuda.as_cuda_array(t_spread_integral_next)
+            d_mtm_next = cuda.as_cuda_array(t_mtm_next)
+            d_rate_integral_now = cuda.as_cuda_array(t_rate_integral_now)
+            d_rate_integral_next = cuda.as_cuda_array(t_rate_integral_next)
+            d_def = cuda.as_cuda_array(t_def)
+            d_labels_by_cpty = cuda.as_cuda_array(t_labels_by_cpty)
             d_out = cuda.as_cuda_array(t_out)
         if as_cuda_tensor:
             out = t_out
@@ -192,3 +298,13 @@ class CVAEstimatorPortfolioInt(XVAEstimatorPortfolio):
                 yield out.reshape(-1, 1)
             if not accumulate:
                 accumulate = True
+
+    def _build_loss_backward(self, window):
+        labels_gen_start = self._build_labels_backward(True)
+        labels_gen_end = self._build_labels_backward(True)
+        for t in range(self.diffusion_engine.num_coarse_steps, -1, -1):
+            if t > self.diffusion_engine.num_coarse_steps-window:
+                yield next(labels_gen_start).view(self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths)
+            else:
+                df = (torch.as_tensor(self.diffusion_engine.dom_rate_integral[t], dtype=torch.float32, device=self.device)-torch.as_tensor(self.diffusion_engine.dom_rate_integral[t+window], dtype=torch.float32, device=self.device)).exp_()
+                yield next(labels_gen_start).view(self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths)-next(labels_gen_end).view(self.diffusion_engine.num_defs_per_path, self.diffusion_engine.num_paths)*df[None, :]
