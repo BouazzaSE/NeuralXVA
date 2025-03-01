@@ -542,6 +542,7 @@ class DiffusionEngine:
                                         self.d_vanillas_on_fx_i32, self.d_vanillas_on_fx_b8, 
                                         self.d_rng_states, self.dt, self.max_coarse_per_reset, 
                                         self.g_diff_params, self.g_R, self.g_L_T)
+        self.d_def_indicators[1] = self.d_def_indicators[0]
         self.cuda_oversimulate_defs(1, 1, self.d_def_indicators, 
                                     self.d_spread_integrals, self.d_exp_1)
     

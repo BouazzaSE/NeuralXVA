@@ -18,7 +18,7 @@
 import math
 import numba as nb
 from numba import cuda
-from numba.cuda.random import xoroshiro128p_normal_float32, xoroshiro128p_uniform_float32, xoroshiro128p_dtype
+from numba.cuda.random import xoroshiro128p_uniform_float32, xoroshiro128p_dtype
 
 
 def compile_cuda_generate_exp1(num_spreads, num_defs_per_path, num_paths, ntpb, stream):
@@ -427,7 +427,6 @@ def compile_cuda_nested_cva(irs_batch_size, vanilla_batch_size, g_diff_params, g
     drift_adj_start = 4*num_rates - 1
     spread_start = fx_start + num_rates - 1
     spread_params_start = fx_params_start + 2*num_rates - 2
-    full_mask = nb.uint32(-1)
 
     if num_inner_paths & (num_inner_paths-1) == 0:
         inner_stride = num_inner_paths

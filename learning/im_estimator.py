@@ -17,7 +17,6 @@
 
 from learning.generic_estimator import GenericEstimator
 from learning.xva_estimator import XVAEstimatorPortfolio
-import numba as nb
 from numba import cuda
 import numexpr as ne
 import numpy as np

@@ -204,13 +204,13 @@ class ModelRandomAlphaPiecewiseAffine(torch.nn.Module):
         self.init_weights()
     
     def init_weights(self):
-        for l in chain(self.h, (self.o,)):
-            torch.nn.init.normal_(l.W, mean=0., std=np.sqrt(1/l.W.shape[0]))
-            torch.nn.init.zeros_(l.b)
+        for layer in chain(self.h, (self.o,)):
+            torch.nn.init.normal_(layer.W, mean=0., std=np.sqrt(1/layer.W.shape[0]))
+            torch.nn.init.zeros_(layer.b)
     def forward(self, x):
         a = (x[:, 1:]-self.x_mean[:, 1:])/self.x_std[:, 1:]
-        for l in self.h:
-            a = l(a)
+        for layer in self.h:
+            a = layer(a)
         a = self.o(a)
         a = a[:, 0, None]+((torch.minimum(x[:, 0, None], self.interpolation_nodes[None, 1:])-self.interpolation_nodes[None, :-1])*(self.interpolation_nodes[None, :-1]>=x[:, 0, None])*a[:, 1:]/self.interpolation_nodes_delta[None, :]).sum(1, keepdim=True)
         return a*self.y_std+self.y_mean
@@ -231,23 +231,23 @@ class GenericModel(torch.jit.ScriptModule):
         self.init_weights()
 
     def init_weights(self):
-        for l in chain(self.h, (self.o,)):
-            torch.nn.init.normal_(l.W, mean=0., std=np.sqrt(1/l.W.shape[0]))
-            torch.nn.init.zeros_(l.b)
+        for layer in chain(self.h, (self.o,)):
+            torch.nn.init.normal_(layer.W, mean=0., std=np.sqrt(1/layer.W.shape[0]))
+            torch.nn.init.zeros_(layer.b)
 
     @torch.jit.script_method
     def forward(self, x):
         a = x
-        for l in self.h:
-            a = l(a)
+        for layer in self.h:
+            a = layer(a)
         return self.o(a)
     
     @torch.jit.script_method
     def forward_backward(self, x):
         # DON'T FORGET TO DIVIDE THE FINAL DIFFS BY STD_X & MULTIPLY WITH STD_Y !
         a, da = self.h[0].forward_backward(x, True)
-        for l in self.h[1:]:
-            a, l_da = l.forward_backward(a, False)
+        for layer in self.h[1:]:
+            a, l_da = layer.forward_backward(a, False)
             da = da @ l_da
         a, l_da = self.o.forward_backward(a)
         da = da @ l_da
@@ -359,12 +359,12 @@ class GenericEstimator:
         if compute_heuristic:
             raise NotImplementedError
             # TODO: fix the following and account for the new batch generator
-            _t_features_holdout_reshaped = torch.reshape(t_features_holdout, (-1, num_paths, features.shape[1]))
-            _t_labels_holdout_reshaped = torch.reshape(t_labels_holdout, (-1, num_paths, labels.shape[1]))
-            t_features_h_1 = (_t_features_holdout_reshaped[1].cuda(self.device)-self.t_features_mean[None])/(self.t_features_std[None] + 1e-7)
-            t_labels_h_1 = _t_labels_holdout_reshaped[1].cuda(self.device)/(self.t_labels_std[None] + 1e-7)
-            t_features_h_2 = (_t_features_holdout_reshaped[2].cuda(self.device)-self.t_features_mean[None])/(self.t_features_std[None] + 1e-7)
-            t_labels_h_2 = _t_labels_holdout_reshaped[2].cuda(self.device)/(self.t_labels_std[None] + 1e-7)
+            # _t_features_holdout_reshaped = torch.reshape(t_features_holdout, (-1, num_paths, features.shape[1]))
+            # _t_labels_holdout_reshaped = torch.reshape(t_labels_holdout, (-1, num_paths, labels.shape[1]))
+            # t_features_h_1 = (_t_features_holdout_reshaped[1].cuda(self.device)-self.t_features_mean[None])/(self.t_features_std[None] + 1e-7)
+            # t_labels_h_1 = _t_labels_holdout_reshaped[1].cuda(self.device)/(self.t_labels_std[None] + 1e-7)
+            # t_features_h_2 = (_t_features_holdout_reshaped[2].cuda(self.device)-self.t_features_mean[None])/(self.t_features_std[None] + 1e-7)
+            # t_labels_h_2 = _t_labels_holdout_reshaped[2].cuda(self.device)/(self.t_labels_std[None] + 1e-7)
 
         best_loss = math.inf
 
@@ -389,19 +389,19 @@ class GenericEstimator:
                 if compute_heuristic:
                     raise NotImplementedError
                     # TODO: fix the following and account for the new batch generator
-                    with torch.no_grad():
-                        _f1 = self._loss_fct_pointwise(self.model(t_features_h_1), t_labels_h_1)
-                        _f2 = self._loss_fct_pointwise(self.model(t_features_h_2), t_labels_h_2)
-                        _m_f0_sq = (0.5*(_f1+_f2).mean().item())**2
-                        _m_f0f0 = 0.5*(_f1**2+_f2**2).mean().item()
-                        _var = _m_f0f0 - _m_f0_sq
-                        _m_f1f2 = (_f1*_f2).mean().item()
-                        try:
-                            print('[i={}] "optimal" N = {}, _m_f0f0 = {}, _m_f1f2 = {}, _m_f0_sq = {}, _var = {}'.format(i, \
-                                np.sqrt((abs(_m_f0f0-_m_f1f2)+1e-7)/(abs(_m_f0_sq-_m_f1f2)+1e-7)), _m_f0f0, _m_f1f2, _m_f0_sq, _var))
-                        except:
-                            print(_m_f0f0, _m_f1f2, _m_f0_sq, _m_f1f2)
-                            raise
+                    # with torch.no_grad():
+                    #     _f1 = self._loss_fct_pointwise(self.model(t_features_h_1), t_labels_h_1)
+                    #     _f2 = self._loss_fct_pointwise(self.model(t_features_h_2), t_labels_h_2)
+                    #     _m_f0_sq = (0.5*(_f1+_f2).mean().item())**2
+                    #     _m_f0f0 = 0.5*(_f1**2+_f2**2).mean().item()
+                    #     _var = _m_f0f0 - _m_f0_sq
+                    #     _m_f1f2 = (_f1*_f2).mean().item()
+                    #     try:
+                    #         print('[i={}] "optimal" N = {}, _m_f0f0 = {}, _m_f1f2 = {}, _m_f0_sq = {}, _var = {}'.format(i, \
+                    #             np.sqrt((abs(_m_f0f0-_m_f1f2)+1e-7)/(abs(_m_f0_sq-_m_f1f2)+1e-7)), _m_f0f0, _m_f1f2, _m_f0_sq, _var))
+                    #     except:
+                    #         print(_m_f0f0, _m_f1f2, _m_f0_sq, _m_f1f2)
+                    #         raise
                 if self.multiple_var and (not self.piecewise_affine_var):
                     y_pred, dy_pred = self.model.forward_backward(features_batch)
                 else:
@@ -435,8 +435,8 @@ class GenericEstimator:
                                 # features_batch /= (self.t_features_std[None] + 1e-16)
                                 # labels_batch /= (self.t_labels_std[None] + 1e-16)
                                 h = features_batch
-                                for l in self.model.h:
-                                    h = l(h)
+                                for layer in self.model.h:
+                                    h = layer(h)
                                 h_aug[:, 1:] = h
                                 with cp.cuda.Device(self.device.index):
                                     sol, _, _, _ = cp.linalg.lstsq(cp.asarray(h_aug), cp.asarray(labels_batch), rcond=None)
@@ -486,17 +486,17 @@ class GenericEstimator:
                 if self.holdout_size > 0:
                     raise NotImplementedError
                     # TODO: fix the following and account for the new batch generator
-                    total_validation_loss = 0
-                    for _, eff_batch_size, features_batch, labels_batch, weights_batch in weighted_batch_iterate(t_features_holdout, t_labels_holdout, t_weights_holdout, t_features_batch, t_labels_batch, t_weights_batch, self.batch_size):
-                        # features_batch -= self.t_features_mean[None]
-                        # features_batch /= (self.t_features_std[None] + 1e-16)
-                        # labels_batch /= (self.t_labels_std[None] + 1e-16)
-                        if weights_batch is None:
-                            total_validation_loss += self._loss_fct(self.model(features_batch), labels_batch)*eff_batch_size/t_features_holdout.shape[0]
-                        else:
-                            weights_batch_sum = weights_batch.sum()
-                            total_validation_loss += self._weighted_loss_fct(self.model(features_batch), labels_batch, weights_batch)*weights_batch_sum/weights_holdout_sum
-                    total_validation_loss = total_validation_loss.item()
+                    # total_validation_loss = 0
+                    # for _, eff_batch_size, features_batch, labels_batch, weights_batch in weighted_batch_iterate(t_features_holdout, t_labels_holdout, t_weights_holdout, t_features_batch, t_labels_batch, t_weights_batch, self.batch_size):
+                    #     features_batch -= self.t_features_mean[None]
+                    #     features_batch /= (self.t_features_std[None] + 1e-16)
+                    #     labels_batch /= (self.t_labels_std[None] + 1e-16)
+                    #     if weights_batch is None:
+                    #         total_validation_loss += self._loss_fct(self.model(features_batch), labels_batch)*eff_batch_size/t_features_holdout.shape[0]
+                    #     else:
+                    #         weights_batch_sum = weights_batch.sum()
+                    #         total_validation_loss += self._weighted_loss_fct(self.model(features_batch), labels_batch, weights_batch)*weights_batch_sum/weights_holdout_sum
+                    # total_validation_loss = total_validation_loss.item()
                 else:
                     total_validation_loss = np.nan
                 

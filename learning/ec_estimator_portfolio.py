@@ -21,7 +21,7 @@ import numba as nb
 from numba import cuda
 import numpy as np
 import torch
-from typing import Generator, List
+from typing import List
 
 def compile_unpack(num_spreads):
     @nb.jit((nb.int8[:, :, :], nb.float32[:, :, :]), nopython=True, nogil=True)
@@ -141,18 +141,14 @@ class ECEstimatorPortfolio(XVAEstimatorPortfolio):
         while True:
             t = yield
             t_prev_reset = self.prev_reset_arr[t]
-            if t_prev_reset == 0:
-                t_prev_reset = t
+            if t_prev_reset < 0:
+                t_prev_reset = 0
+            X_prev = torch.as_tensor(self.diffusion_engine.X[t_prev_reset])
             if load_from_device:
                 X = torch.as_tensor(self.diffusion_engine.d_X[self.diffusion_engine.max_coarse_per_reset], device=self.device)
-                # very messy
-                # TODO: clean this up
-                shift = (t-1) % self.diffusion_engine.max_coarse_per_reset + 1
-                X_prev = torch.as_tensor(self.diffusion_engine.d_X[self.diffusion_engine.max_coarse_per_reset-shift], device=self.device)
                 def_indicators = torch.as_tensor(self.diffusion_engine.d_def_indicators[1])
             else:
                 X = torch.as_tensor(self.diffusion_engine.X[t])
-                X_prev = torch.as_tensor(self.diffusion_engine.X[t_prev_reset])
                 def_indicators = torch.as_tensor(self.diffusion_engine.def_indicators[t])
             def __gen_features(mean=None, std=None):
                 nonlocal features_gpu
